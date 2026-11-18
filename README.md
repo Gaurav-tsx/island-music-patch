@@ -2,6 +2,8 @@
 
 An unofficial source patch for the Windows version of Coucou. It adds a YouTube Music pill with inline song and playlist search, background playback, and a separate volume level that stays put when you switch pills. It also adds a session-scoped Auto Allow toggle for new agent permission requests.
 
+The latest release includes working Next and Previous controls, a configurable hover-close delay, and a 1-second Auto-close option. [Download the latest patch](https://github.com/Gaurav-tsx/island-music-patch/releases/latest)
+
 ## Apply the patch
 
 Use the Windows build prerequisites from the [upstream Windows README](https://github.com/Louis-CFM/coucou/blob/main/windows/README.md). Run these commands from the checkout with Git, Node.js, Rust and the Windows C++ build tools available.
@@ -10,13 +12,15 @@ Use the Windows build prerequisites from the [upstream Windows README](https://g
 git clone https://github.com/Louis-CFM/coucou.git
 cd coucou
 git checkout 0d7fe58884d99f275f3238e8dbe29ddee69fa9e8
-git apply C:/path/to/island-music.patch
+Invoke-WebRequest https://github.com/Gaurav-tsx/island-music-patch/releases/latest/download/island-music.patch -OutFile island-music.patch
+git apply --check island-music.patch
+git apply island-music.patch
 cd windows
 npm ci
-npm run tauri build
+npm run pack
 ```
 
-Enable **YouTube Music** under **Settings → Active pills**. Search results appear inside the island, and the music-note button opens the full player on demand. On an agent approval card, **Auto Allow** applies to future permission requests from that session. The header lets you turn it off.
+Run the `Coucou-Windows-setup.exe` you built in `windows/release/`. Enable **YouTube Music** under **Settings → Active pills**. Search results appear inside the island, and the music-note button opens the full player on demand. On an agent approval card, **Auto Allow** applies to future permission requests from that session. The header lets you turn it off.
 
 ## Credits
 
