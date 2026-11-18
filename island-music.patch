@@ -1,0 +1,1549 @@
+diff --git a/README.md b/README.md
+index 9bf34ba..387fea1 100644
+--- a/README.md
++++ b/README.md
+@@ -28,6 +28,12 @@ Approve permissions, watch your agents work, drop a file, chat with Claude — a
+ 
+ ---
+ 
++## Windows community patch
++
++This working copy adds YouTube Music search and background playback to the Windows island, a separate music volume control, and a session-scoped Auto Allow switch for agent permissions. Only the Windows app was changed.
++
++**Coucou was created by [Louis Raillé (Louis-CFM)](https://github.com/Louis-CFM).** Thank you, Louis, for creating Coucou and sharing its source. Thanks also to the contributors who maintain the project. The [original Coucou repository](https://github.com/Louis-CFM/coucou) is the home of official releases.
++
+ ## Why
+ 
+ Some studios showed off gorgeous notch companions… and never let anyone use them.
+diff --git a/windows/src-tauri/src/lib.rs b/windows/src-tauri/src/lib.rs
+index 8b91c97..b6d49f3 100644
+--- a/windows/src-tauri/src/lib.rs
++++ b/windows/src-tauri/src/lib.rs
+@@ -41,6 +41,7 @@ mod shortcuts;
+ mod sounds;
+ mod speech;
+ mod spotify;
++mod youtube_music;
+ mod tray;
+ mod update;
+ mod voice;
+@@ -142,6 +143,7 @@ fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
+     }
+     integrations::settings_saved(&app, &settings.active_integrations);
+     spotify::sync(&app, &settings.active_integrations);
++    youtube_music::sync(&app, &settings.active_integrations);
+     whatsapp::sync(&settings.active_integrations);
+     if shortcuts_changed {
+         shortcuts::apply(&app, &settings.shortcuts);
+@@ -1025,6 +1027,11 @@ pub fn run() {
+             spotify::spotify_control,
+             spotify::spotify_open,
+             spotify::spotify_installed,
++            youtube_music::youtube_music_open,
++            youtube_music::youtube_music_search,
++            youtube_music::youtube_music_play,
++            youtube_music::youtube_music_state,
++            youtube_music::youtube_music_control,
+             whatsapp::whatsapp_island,
+             whatsapp::whatsapp_open,
+             whatsapp::whatsapp_close,
+diff --git a/windows/src-tauri/src/youtube_music.js b/windows/src-tauri/src/youtube_music.js
+new file mode 100644
+index 0000000..9588283
+--- /dev/null
++++ b/windows/src-tauri/src/youtube_music.js
+@@ -0,0 +1,168 @@
++(() => {
++  if (location.origin !== "https://music.youtube.com") return;
++
++  const volumeKey = "coucou.music.volume";
++  const savedVolume = localStorage.getItem(volumeKey);
++  let volume = savedVolume === null ? 50 : Math.max(0, Math.min(100, Number(savedVolume) || 0));
++  let previousMedia = null;
++  let mutedBeforeAd = null;
++  let searchRevision = 0;
++  let previousSearchData;
++  const searchPage = () => document.querySelector("ytmusic-search-page");
++  const player = () => document.querySelector("#movie_player");
++  const media = () => player()?.querySelector("video, audio");
++  const showingAd = () => player()?.classList.contains("ad-showing") ?? false;
++
++  function applyVolume(element) {
++    const level = volume / 100;
++    if (Math.abs(element.volume - level) > 0.0001) element.volume = level;
++  }
++
++  function updatePlayer() {
++    const element = media();
++    if (!element) return;
++    if (previousMedia !== element) {
++      previousMedia = element;
++      mutedBeforeAd = null;
++    }
++    applyVolume(element);
++    if (showingAd()) {
++      mutedBeforeAd ??= element.muted;
++      element.muted = true;
++      const skip = player().querySelector(
++        ".ytp-skip-ad-button, .ytp-ad-skip-button-modern, .ytp-ad-skip-button"
++      );
++      if (skip && !skip.disabled) skip.click();
++      else if (Number.isFinite(element.duration) && element.currentTime < element.duration - 0.1) {
++        element.currentTime = element.duration;
++      }
++    } else if (mutedBeforeAd !== null) {
++      element.muted = mutedBeforeAd;
++      mutedBeforeAd = null;
++    }
++  }
++
++  let pending = false;
++  new MutationObserver(() => {
++    if (pending) return;
++    pending = true;
++    queueMicrotask(() => {
++      pending = false;
++      updatePlayer();
++    });
++  }).observe(document, { subtree: true, childList: true, attributes: true, attributeFilter: ["class"] });
++  document.addEventListener("loadedmetadata", updatePlayer, true);
++  document.addEventListener("playing", updatePlayer, true);
++  document.addEventListener("volumechange", (event) => {
++    if (event.target === media()) applyVolume(event.target);
++  }, true);
++
++  function searchResults() {
++    const results = new Map();
++    const rows = searchPage()?.querySelectorAll(
++      "ytmusic-responsive-list-item-renderer, ytmusic-two-row-item-renderer, ytmusic-card-shelf-renderer"
++    ) ?? [];
++    for (const row of rows) {
++      const title = row.querySelector(".title")?.textContent?.trim();
++      if (!title) continue;
++      for (const link of row.querySelectorAll("a[href]")) {
++        const url = new URL(link.href, location.href);
++        if (url.origin !== location.origin) continue;
++        const kind = url.pathname === "/watch" ? "song" : "playlist";
++        const id = kind === "song" ? url.searchParams.get("v")
++          : url.pathname === "/playlist" ? url.searchParams.get("list")
++          : url.pathname.startsWith("/browse/VL") ? url.pathname.slice(10) : null;
++        if (!id || !/^[A-Za-z0-9_-]{1,128}$/.test(id)) continue;
++        const key = `${kind}:${id}`;
++        if (!results.has(key)) results.set(key, { id, kind, title: title.slice(0, 256), row, link });
++        break;
++      }
++    }
++    return results;
++  }
++
++  window.coucouMusic = {
++    search(url) {
++      const revision = ++searchRevision;
++      const app = document.querySelector("ytmusic-app");
++      if (!app?.querySelector("ytmusic-search-box")) {
++        location.assign(url);
++        return;
++      }
++      const destination = new URL(url);
++      const original = location.href;
++      previousSearchData = new URL(original).searchParams.get("q") === destination.searchParams.get("q")
++        ? undefined : searchPage()?.data;
++      app.dispatchEvent(new CustomEvent("yt-navigate", {
++        bubbles: true, composed: true,
++        detail: { endpoint: {
++          commandMetadata: { webCommandMetadata: { url: destination.pathname + destination.search } },
++          searchEndpoint: { query: destination.searchParams.get("q") },
++        } },
++      }));
++      setTimeout(() => {
++        if (revision === searchRevision && location.href === original && original !== url) location.assign(url);
++      }, 800);
++    },
++    results(query) {
++      const active = new URL(location.href);
++      const page = searchPage();
++      if (active.pathname !== "/search" || active.searchParams.get("q") !== query
++        || !page?.data || page.data === previousSearchData
++        || !page.querySelector("ytmusic-section-list-renderer")) return null;
++      return [...searchResults().values()].slice(0, 40).map(({ id, kind, title }) => ({ id, kind, title }));
++    },
++    play(kind, id) {
++      const result = searchResults().get(`${kind}:${id}`);
++      if (!result) return false;
++      if (kind === "song") {
++        result.link.click();
++        return true;
++      }
++      const button = result.row.querySelector("ytmusic-play-button-renderer");
++      if (button) {
++        button.click();
++        return true;
++      }
++      const overlay = result.row.data?.overlay?.musicItemThumbnailOverlayRenderer;
++      const endpoint = overlay?.content?.musicPlayButtonRenderer?.playNavigationEndpoint;
++      if (endpoint) {
++        result.row.dispatchEvent(new CustomEvent("yt-navigate", {
++          bubbles: true, composed: true, detail: { endpoint },
++        }));
++      } else {
++        const destination = new URL("/watch", location.origin);
++        destination.searchParams.set("list", id);
++        location.assign(destination.href);
++      }
++      return true;
++    },
++    state() {
++      updatePlayer();
++      const element = media();
++      const metadata = navigator.mediaSession?.metadata;
++      const bar = document.querySelector("ytmusic-player-bar");
++      const hasTrack = element?.currentSrc && !showingAd();
++      return {
++        title: hasTrack ? (metadata?.title || bar?.querySelector(".title")?.textContent || "").trim().slice(0, 256) : "",
++        artist: hasTrack ? (metadata?.artist || bar?.querySelector(".byline")?.textContent || "").trim().slice(0, 256) : "",
++        playing: !!hasTrack && !element.paused && !element.ended,
++        volume,
++      };
++    },
++    toggle() {
++      const element = media();
++      if (!element) return;
++      if (element.paused) void element.play().catch(() => {});
++      else element.pause();
++    },
++    next() { document.querySelector("ytmusic-player-bar .next-button")?.click(); },
++    previous() { document.querySelector("ytmusic-player-bar .previous-button")?.click(); },
++    volume(value) {
++      volume = value;
++      localStorage.setItem(volumeKey, String(volume));
++      const element = media();
++      if (element) applyVolume(element);
++    },
++  };
++})();
+diff --git a/windows/src-tauri/src/youtube_music.rs b/windows/src-tauri/src/youtube_music.rs
+new file mode 100644
+index 0000000..2a370b0
+--- /dev/null
++++ b/windows/src-tauri/src/youtube_music.rs
+@@ -0,0 +1,217 @@
++use serde::{de::DeserializeOwned, Deserialize, Serialize};
++use std::time::Duration;
++use tauri::webview::NewWindowResponse;
++use tauri::{AppHandle, Manager, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
++
++const LABEL: &str = "youtube-music";
++const PILL_ID: &str = "integration_youtube_music";
++const HOME: &str = "https://music.youtube.com/";
++const SCRIPT: &str = include_str!("youtube_music.js");
++static WINDOW: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
++
++#[cfg(windows)]
++fn install_ad_filter(window: &WebviewWindow) -> tauri::Result<()> {
++    use webview2_com::Microsoft::Web::WebView2::Win32::{
++        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL, COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
++        ICoreWebView2_22,
++    };
++    use webview2_com::{WebResourceRequestedEventHandler, take_pwstr};
++    use wv2_core::{Interface, PWSTR, w};
++
++    window.with_webview(|webview| {
++        let install = || -> wv2_core::Result<()> {
++            // The repository's other webviews and external browsers keep their own request handling.
++            let core = unsafe { webview.controller().CoreWebView2()? };
++            let environment = webview.environment();
++            let newest = core.cast::<ICoreWebView2_22>();
++            for pattern in [
++                w!("https://*.doubleclick.net/*"),
++                w!("https://*.googleadservices.com/*"),
++                w!("https://music.youtube.com/pagead/*"),
++                w!("https://www.youtube.com/pagead/*"),
++            ] {
++                unsafe {
++                    if let Ok(core) = &newest {
++                        core.AddWebResourceRequestedFilterWithRequestSourceKinds(
++                            pattern, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
++                            COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
++                        )?;
++                    } else {
++                        core.AddWebResourceRequestedFilter(pattern, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL)?;
++                    }
++                }
++            }
++            let handler = WebResourceRequestedEventHandler::create(Box::new(move |_, args| {
++                let Some(args) = args else { return Ok(()) };
++                unsafe {
++                    let mut uri = PWSTR::null();
++                    args.Request()?.Uri(&mut uri)?;
++                    let Ok(url) = Url::parse(&take_pwstr(uri)) else { return Ok(()) };
++                    let host = url.host_str().unwrap_or("");
++                    let is_ad = host.ends_with(".doubleclick.net") || host.ends_with(".googleadservices.com")
++                        || (matches!(host, "www.youtube.com" | "music.youtube.com") && url.path().starts_with("/pagead/"));
++                    if is_ad {
++                        let response = environment.CreateWebResourceResponse(None, 204, w!("No Content"), w!(""))?;
++                        args.SetResponse(&response)?;
++                    }
++                }
++                Ok(())
++            }));
++            unsafe { core.add_WebResourceRequested(&handler, &mut 0) }
++        };
++        if let Err(err) = install() {
++            crate::log::line(format!("YouTube Music ad filter: {err}"));
++        }
++    })
++}
++
++#[derive(Deserialize, Serialize)]
++pub struct Playback {
++    title: String,
++    artist: String,
++    playing: bool,
++    volume: u8,
++}
++
++#[derive(Deserialize, Serialize)]
++pub struct SearchResult {
++    id: String,
++    kind: String,
++    title: String,
++}
++
++fn enabled(app: &AppHandle) -> bool {
++    cfg!(windows)
++        && app.state::<crate::Shared>().settings.lock().unwrap()
++            .active_integrations.iter().any(|id| id == PILL_ID)
++}
++
++fn navigate_to_search(window: &WebviewWindow, destination: &Url) -> tauri::Result<()> {
++    // Let the site handle its own navigation when it has finished loading so
++    // searching doesn't replace the page that owns the active player.
++    let endpoint = serde_json::to_string(destination.as_str()).unwrap();
++    window.eval(format!("if (window.coucouMusic && location.origin === 'https://music.youtube.com') {{
++        window.coucouMusic.search({endpoint});
++    }} else {{ location.href = {endpoint}; }}"))
++}
++
++fn player_window(app: &AppHandle, destination: Url, show: bool) -> tauri::Result<WebviewWindow> {
++    if let Some(window) = app.get_webview_window(LABEL) {
++        if show {
++            window.set_skip_taskbar(false)?;
++            window.show()?;
++            window.unminimize()?;
++            window.set_focus()?;
++        } else {
++            window.hide()?;
++            window.set_skip_taskbar(true)?;
++        }
++        if destination.path() == "/search" {
++            navigate_to_search(&window, &destination)?;
++        }
++        return Ok(window);
++    }
++    let profile = app.path().app_local_data_dir()?.join(LABEL);
++    // This remote window has no entry in the app's Tauri capabilities.
++    let window = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::External(destination))
++        .title("YouTube Music · Coucou")
++        .inner_size(960.0, 640.0)
++        .visible(show)
++        .focused(show)
++        .skip_taskbar(!show)
++        .additional_browser_args(crate::BROWSER_ARGS)
++        .data_directory(profile)
++        .initialization_script(SCRIPT)
++        .on_navigation(|url| {
++            url.scheme() == "https" && url.port().is_none()
++                && matches!(url.host_str(), Some("music.youtube.com" | "accounts.google.com"))
++        })
++        .on_new_window(|_, _| NewWindowResponse::Deny)
++        .build()?;
++    #[cfg(windows)]
++    install_ad_filter(&window)?;
++    let handle = app.clone();
++    window.on_window_event(move |event| {
++        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
++            api.prevent_close();
++            if let Some(window) = handle.get_webview_window(LABEL) {
++                let _ = window.hide();
++                let _ = window.set_skip_taskbar(true);
++            }
++        }
++    });
++    Ok(window)
++}
++
++#[tauri::command]
++pub async fn youtube_music_open(app: AppHandle) -> Result<(), String> {
++    let _guard = WINDOW.lock().await;
++    if !enabled(&app) { return Err("Enable the YouTube Music pill first.".into()); }
++    player_window(&app, Url::parse(HOME).unwrap(), true).map(|_| ()).map_err(|err| err.to_string())
++}
++
++async fn evaluate<T: DeserializeOwned + Send + 'static>(window: &WebviewWindow, script: impl Into<String>) -> Option<T> {
++    let (send, mut receive) = tokio::sync::mpsc::channel(1);
++    window.eval_with_callback(script, move |json| {
++        let _ = send.try_send(serde_json::from_str::<T>(&json).ok());
++    }).ok()?;
++    tokio::time::timeout(Duration::from_secs(2), receive.recv()).await.ok()??
++}
++
++#[tauri::command]
++pub async fn youtube_music_search(app: AppHandle, query: String) -> Result<Vec<SearchResult>, String> {
++    let query = query.trim();
++    if query.is_empty() || query.chars().count() > 200 { return Err("Invalid search query.".into()); }
++    let window = {
++        let _guard = WINDOW.lock().await;
++        if !enabled(&app) { return Err("Enable the YouTube Music pill first.".into()); }
++        let mut destination = Url::parse(HOME).unwrap();
++        destination.set_path("search");
++        destination.query_pairs_mut().append_pair("q", query);
++        player_window(&app, destination, false).map_err(|err| err.to_string())?
++    };
++    let query = serde_json::to_string(query).unwrap();
++    let script = format!("window.coucouMusic?.results({query}) ?? null");
++    tokio::time::timeout(Duration::from_secs(15), async {
++        loop {
++            if let Some(results) = evaluate(&window, script.clone()).await { return results; }
++            tokio::time::sleep(Duration::from_millis(250)).await;
++        }
++    }).await.map_err(|_| "YouTube Music search timed out.".into())
++}
++
++#[tauri::command]
++pub async fn youtube_music_play(app: AppHandle, kind: String, id: String) -> bool {
++    if !matches!(kind.as_str(), "song" | "playlist") || id.is_empty() || id.len() > 128
++        || !id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_') {
++        return false;
++    }
++    let Some(window) = app.get_webview_window(LABEL) else { return false };
++    evaluate(&window, format!("window.coucouMusic?.play('{kind}', '{id}') ?? false")).await.unwrap_or(false)
++}
++
++#[tauri::command]
++pub async fn youtube_music_state(app: AppHandle) -> Option<Playback> {
++    let window = app.get_webview_window(LABEL)?;
++    evaluate(&window, "window.coucouMusic?.state() ?? null").await
++}
++
++#[tauri::command]
++pub fn youtube_music_control(app: AppHandle, action: String, volume: Option<u8>) -> bool {
++    let script = match action.as_str() {
++        "toggle" => "window.coucouMusic?.toggle()".to_string(),
++        "next" => "window.coucouMusic?.next()".to_string(),
++        "previous" => "window.coucouMusic?.previous()".to_string(),
++        "volume" => format!("window.coucouMusic?.volume({})", volume.unwrap_or(50).min(100)),
++        _ => return false,
++    };
++    app.get_webview_window(LABEL).is_some_and(|window| window.eval(script).is_ok())
++}
++
++pub fn sync(app: &AppHandle, integrations: &[String]) {
++    if !integrations.iter().any(|id| id == PILL_ID) {
++        if let Some(window) = app.get_webview_window(LABEL) {
++            let _ = window.destroy();
++        }
++    }
++}
+diff --git a/windows/src/core/bridge.ts b/windows/src/core/bridge.ts
+index 9066699..b41fc18 100644
+--- a/windows/src/core/bridge.ts
++++ b/windows/src/core/bridge.ts
+@@ -8,6 +8,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
+ import type { Settings } from "./state";
+ import type { RecapHistory, RecapPrefs } from "../recap/summary";
+ import type { SpotifyState } from "./spotify";
++import type { YouTubeMusicPlayback, YouTubeMusicResult } from "./youtube-music";
+ import type { UpdateStatus } from "./update";
+ import type { WaIslandView, WaSettingsView, WaTestResult } from "./whatsapp";
+ 
+@@ -479,6 +480,12 @@ export const Bridge = {
+   spotifyOpen: () => call<boolean>("spotify_open"),
+   /** Whether there is a Spotify to launch (Settings). */
+   spotifyInstalled: () => call<boolean>("spotify_installed"),
++  youtubeMusicOpen: () => callOrThrow<void>("youtube_music_open"),
++  youtubeMusicSearch: (query: string) => callOrThrow<YouTubeMusicResult[]>("youtube_music_search", { query }),
++  youtubeMusicPlay: ({ id, kind }: YouTubeMusicResult) => call<boolean>("youtube_music_play", { id, kind }),
++  youtubeMusicState: () => call<YouTubeMusicPlayback>("youtube_music_state"),
++  youtubeMusicControl: (action: "toggle" | "next" | "previous" | "volume", volume?: number) =>
++    call<boolean>("youtube_music_control", { action, volume: volume ?? null }),
+ 
+   // ── WhatsApp (src-tauri/src/whatsapp) ─────────────────────────────────────
+   /** The island's copy, asked once at start (then the "whatsapp" event). Island only. */
+diff --git a/windows/src/core/pills.ts b/windows/src/core/pills.ts
+index 929d141..3ecc478 100644
+--- a/windows/src/core/pills.ts
++++ b/windows/src/core/pills.ts
+@@ -138,6 +138,8 @@ export const PILL_CATALOG: readonly PillDefinition[] = [
+   // (src-tauri/src/spotify.rs).
+   { id: "integration_spotify", name: "Spotify", color: "#1DB954", category: "service",
+     subtitle: N_("Integration"), source: "n8n", support: "yes", connect: none },
++  { id: "integration_youtube_music", name: "YouTube Music", color: "#FF4545", category: "service",
++    subtitle: N_("Integration"), source: "n8n", support: "windows", connect: none },
+   // Mail: classic Outlook on Windows, driven on this computer through its COM objects
+   // (src-tauri/src/mail). The new Outlook has none, and Linux has no Outlook.
+   { id: "integration_mail", name: "Mail", color: "#2F8CFF", category: "service",
+diff --git a/windows/src/core/spotify.ts b/windows/src/core/spotify.ts
+index 47d7c20..97305f4 100644
+--- a/windows/src/core/spotify.ts
++++ b/windows/src/core/spotify.ts
+@@ -4,6 +4,7 @@
+ // (BotCanvasView, DesktopMochi.swift).
+ 
+ import type { BotStateName, IslandMode, IslandViewName } from "./layout";
++import { YOUTUBE_MUSIC_ID } from "./youtube-music";
+ 
+ export const SPOTIFY_ID = "integration_spotify";
+ /** SpotifyController.green. */
+@@ -112,7 +113,8 @@ export function islandDances(o: {
+ }): boolean {
+   if (!o.music || !DANCE_STATES.has(o.state)) return false;
+   if (o.mode === "compact") return true;
+-  return o.mode === "expanded" && o.view === "overview" && o.focusId === SPOTIFY_ID;
++  return o.mode === "expanded" && o.view === "overview"
++    && (o.focusId === SPOTIFY_ID || o.focusId === YOUTUBE_MUSIC_ID);
+ }
+ 
+ /** Mochi on the desktop: the compact island's rules (DesktopMochi.swift). */
+diff --git a/windows/src/core/state.ts b/windows/src/core/state.ts
+index 3de60e2..59981e0 100644
+--- a/windows/src/core/state.ts
++++ b/windows/src/core/state.ts
+@@ -13,6 +13,7 @@ import type { Bindings } from "./shortcuts";
+ import { DEFAULT_OUTFIT, type Outfit } from "../mochi/wardrobe";
+ import { pillColor } from "./pill-colors";
+ import { Spotify, musicPlaying } from "./spotify";
++import { YouTubeMusic, YOUTUBE_MUSIC_ID } from "./youtube-music";
+ 
+ export type AgentSource = "claudeCode" | "n8n" | "agent";
+ export type PillBadge = "approval" | "finished" | "error";
+@@ -284,6 +285,29 @@ class AppState {
+   os: HostOs = HOST_OS;
+ 
+   private listeners = new Set<Listener>();
++  private readonly autoAllow = new Set<string>();
++
++  get hasAutoAllow(): boolean {
++    return this.autoAllow.size > 0;
++  }
++
++  autoAllows(pillId: string, sessionId: string): boolean {
++    return !!sessionId && this.autoAllow.has(JSON.stringify([pillId, sessionId]));
++  }
++
++  setAutoAllow(pillId: string, sessionId: string, enabled: boolean) {
++    if (!sessionId) return;
++    const key = JSON.stringify([pillId, sessionId]);
++    if (enabled) this.autoAllow.add(key);
++    else if (!this.autoAllow.delete(key)) return;
++    this.notify();
++  }
++
++  clearAutoAllow() {
++    if (!this.hasAutoAllow) return;
++    this.autoAllow.clear();
++    this.notify();
++  }
+ 
+   subscribe(fn: Listener): () => void {
+     this.listeners.add(fn);
+@@ -303,11 +327,15 @@ class AppState {
+     return this.stateOverride ?? this.focusTask?.state ?? "idle";
+   }
+ 
+-  /** Spotify plays on a declared pill: Mochi dances (Linux; never on Windows yet). */
+   get spotifyPlaying(): boolean {
+     return musicPlaying(Spotify.state, sanitizeDeclared(this.settings, this.os).activeIntegrations);
+   }
+ 
++  get youtubeMusicPlaying(): boolean {
++    return this.os === "windows" && this.settings.activeIntegrations.includes(YOUTUBE_MUSIC_ID)
++      && YouTubeMusic.playback?.playing === true;
++  }
++
+   get otherTasks(): AgentTask[] {
+     return this.tasks.filter((t) => t.id !== this.focusId);
+   }
+diff --git a/windows/src/core/youtube-music.ts b/windows/src/core/youtube-music.ts
+new file mode 100644
+index 0000000..b954ca3
+--- /dev/null
++++ b/windows/src/core/youtube-music.ts
+@@ -0,0 +1,16 @@
++export const YOUTUBE_MUSIC_ID = "integration_youtube_music";
++
++export interface YouTubeMusicPlayback {
++  title: string;
++  artist: string;
++  playing: boolean;
++  volume: number;
++}
++
++export interface YouTubeMusicResult {
++  id: string;
++  kind: "song" | "playlist";
++  title: string;
++}
++
++export const YouTubeMusic = { playback: null as YouTubeMusicPlayback | null };
+diff --git a/windows/src/i18n/extra.json b/windows/src/i18n/extra.json
+index 1a84bef..5b6db40 100644
+--- a/windows/src/i18n/extra.json
++++ b/windows/src/i18n/extra.json
+@@ -7563,6 +7563,141 @@
+       "tr": "Yalnızca dikte ederken, bir görüşmeyi kaydederken veya mesaj gelince görünür. Dikte tuşu yine çalışır.",
+       "ko": "받아쓰기하거나 통화를 녹음하거나 메시지가 올 때만 표시됩니다. 받아쓰기 키는 그대로 작동합니다.",
+       "ja": "音声入力中、通話の録音中、メッセージが届いたときだけ表示されます。音声入力キーはそのまま使えます。"
++    },
++    "Search songs and playlists": {
++      "zh-Hans": "搜索歌曲和播放列表",
++      "hi": "गाने और प्लेलिस्ट खोजें",
++      "es": "Buscar canciones y listas",
++      "ar": "ابحث عن الأغاني وقوائم التشغيل",
++      "fr": "Chercher des titres et des playlists",
++      "bn": "গান ও প্লেলিস্ট খুঁজুন",
++      "pt-BR": "Buscar músicas e playlists",
++      "ru": "Поиск песен и плейлистов",
++      "id": "Cari lagu dan playlist",
++      "de": "Titel und Playlists suchen",
++      "tr": "Şarkı ve oynatma listesi ara",
++      "ko": "노래와 재생목록 검색",
++      "ja": "曲とプレイリストを検索"
++    },
++    "Open YouTube Music": {
++      "zh-Hans": "打开 YouTube Music",
++      "hi": "YouTube Music खोलें",
++      "es": "Abrir YouTube Music",
++      "ar": "افتح YouTube Music",
++      "fr": "Ouvrir YouTube Music",
++      "bn": "YouTube Music খুলুন",
++      "pt-BR": "Abrir o YouTube Music",
++      "ru": "Открыть YouTube Music",
++      "id": "Buka YouTube Music",
++      "de": "YouTube Music öffnen",
++      "tr": "YouTube Music'i aç",
++      "ko": "YouTube Music 열기",
++      "ja": "YouTube Music を開く"
++    },
++    "Could not open YouTube Music": {
++      "zh-Hans": "无法打开 YouTube Music",
++      "hi": "YouTube Music नहीं खुल सका",
++      "es": "No se pudo abrir YouTube Music",
++      "ar": "تعذّر فتح YouTube Music",
++      "fr": "Impossible d’ouvrir YouTube Music",
++      "bn": "YouTube Music খোলা যায়নি",
++      "pt-BR": "Não foi possível abrir o YouTube Music",
++      "ru": "Не удалось открыть YouTube Music",
++      "id": "YouTube Music tidak dapat dibuka",
++      "de": "YouTube Music konnte nicht geöffnet werden",
++      "tr": "YouTube Music açılamadı",
++      "ko": "YouTube Music을 열 수 없습니다",
++      "ja": "YouTube Music を開けませんでした"
++    },
++    "YouTube Music volume": {
++      "zh-Hans": "YouTube Music 音量",
++      "hi": "YouTube Music का वॉल्यूम",
++      "es": "Volumen de YouTube Music",
++      "ar": "مستوى صوت YouTube Music",
++      "fr": "Volume de YouTube Music",
++      "bn": "YouTube Music-এর ভলিউম",
++      "pt-BR": "Volume do YouTube Music",
++      "ru": "Громкость YouTube Music",
++      "id": "Volume YouTube Music",
++      "de": "Lautstärke von YouTube Music",
++      "tr": "YouTube Music ses düzeyi",
++      "ko": "YouTube Music 볼륨",
++      "ja": "YouTube Music の音量"
++    },
++    "Songs": {
++      "zh-Hans": "歌曲",
++      "hi": "गाने",
++      "es": "Canciones",
++      "ar": "الأغاني",
++      "fr": "Titres",
++      "bn": "গান",
++      "pt-BR": "Músicas",
++      "ru": "Песни",
++      "id": "Lagu",
++      "de": "Titel",
++      "tr": "Şarkılar",
++      "ko": "노래",
++      "ja": "曲"
++    },
++    "Playlists": {
++      "zh-Hans": "播放列表",
++      "hi": "प्लेलिस्ट",
++      "es": "Listas de reproducción",
++      "ar": "قوائم التشغيل",
++      "fr": "Playlists",
++      "bn": "প্লেলিস্ট",
++      "pt-BR": "Playlists",
++      "ru": "Плейлисты",
++      "id": "Playlist",
++      "de": "Playlists",
++      "tr": "Oynatma listeleri",
++      "ko": "재생목록",
++      "ja": "プレイリスト"
++    },
++    "Auto Allow": {
++      "zh-Hans": "自动允许",
++      "hi": "अपने आप अनुमति दें",
++      "es": "Permitir automáticamente",
++      "ar": "سماح تلقائي",
++      "fr": "Autoriser automatiquement",
++      "bn": "স্বয়ংক্রিয় অনুমতি",
++      "pt-BR": "Permitir automaticamente",
++      "ru": "Разрешать автоматически",
++      "id": "Izinkan otomatis",
++      "de": "Automatisch erlauben",
++      "tr": "Otomatik izin ver",
++      "ko": "자동 허용",
++      "ja": "自動で許可"
++    },
++    "Turn off Auto Allow": {
++      "zh-Hans": "关闭自动允许",
++      "hi": "अपने आप अनुमति देना बंद करें",
++      "es": "Desactivar el permiso automático",
++      "ar": "إيقاف السماح التلقائي",
++      "fr": "Désactiver l’autorisation automatique",
++      "bn": "স্বয়ংক্রিয় অনুমতি বন্ধ করুন",
++      "pt-BR": "Desativar a permissão automática",
++      "ru": "Отключить автоматическое разрешение",
++      "id": "Nonaktifkan izin otomatis",
++      "de": "Automatische Freigabe ausschalten",
++      "tr": "Otomatik izni kapat",
++      "ko": "자동 허용 끄기",
++      "ja": "自動許可をオフにする"
++    },
++    "Automatically allow new requests from this session": {
++      "zh-Hans": "自动允许此会话发出的新请求",
++      "hi": "इस सत्र के नए अनुरोधों को अपने आप अनुमति दें",
++      "es": "Permitir automáticamente nuevas solicitudes de esta sesión",
++      "ar": "السماح تلقائيًا بالطلبات الجديدة من هذه الجلسة",
++      "fr": "Autoriser automatiquement les nouvelles demandes de cette session",
++      "bn": "এই সেশনের নতুন অনুরোধগুলো স্বয়ংক্রিয়ভাবে অনুমোদন করুন",
++      "pt-BR": "Permitir automaticamente novas solicitações desta sessão",
++      "ru": "Автоматически разрешать новые запросы этого сеанса",
++      "id": "Otomatis izinkan permintaan baru dari sesi ini",
++      "de": "Neue Anfragen aus dieser Sitzung automatisch erlauben",
++      "tr": "Bu oturumdaki yeni isteklere otomatik izin ver",
++      "ko": "이 세션의 새 요청 자동 허용",
++      "ja": "このセッションからの新しいリクエストを自動で許可する"
+     }
+   }
+ }
+diff --git a/windows/src/island/desktop.ts b/windows/src/island/desktop.ts
+index 50d11b6..6d6e4d3 100644
+--- a/windows/src/island/desktop.ts
++++ b/windows/src/island/desktop.ts
+@@ -171,7 +171,7 @@ export class DesktopLink {
+       soundEnabled: State.settings.soundEnabled,
+       soundVolume: State.settings.soundVolume,
+       paused: State.paused,
+-      dancing: desktopDances(State.spotifyPlaying, State.effectiveState),
++      dancing: desktopDances(State.spotifyPlaying || State.youtubeMusicPlaying, State.effectiveState),
+     };
+     const key = JSON.stringify(snapshot);
+     if (key === this.pushed) return;
+diff --git a/windows/src/island/hooks.ts b/windows/src/island/hooks.ts
+index dc747a6..2c2a76d 100644
+--- a/windows/src/island/hooks.ts
++++ b/windows/src/island/hooks.ts
+@@ -431,6 +431,7 @@ function handleHook(island: Island, payload: HookPayload) {
+     const moot = dropQueued((x) => x.pillId === agentId && x.sessionId === (payload.session_id ?? ""));
+     for (const x of moot) if (x.requestId) void Bridge.approvalDecline(x.requestId);
+   }
++  if (name === "SessionEnd") State.setAutoAllow(agentId, sessionId, false);
+ 
+   // The turn that asked for a permission is over — answered in the terminal,
+   // interrupted, or a new prompt — so the card would be lying. It goes, and the
+@@ -621,6 +622,13 @@ function handleHook(island: Island, payload: HookPayload) {
+         break;
+       }
+ 
++      const tool = payload.tool_name ?? "Tool";
++      const input = payload.tool_input ?? {};
++      if (requestId && payload.tool_name && !/(AskUserQuestion|request_user_input)$/i.test(tool) && State.autoAllows(agentId, sessionId)) {
++        void Bridge.approvalDecision(requestId, "allow");
++        break;
++      }
++
+       // Several requests can wait at once (several sessions or agents): they
+       // queue and the card shows the oldest. Past the cap, the newest goes back
+       // to its own terminal.
+@@ -632,8 +640,6 @@ function handleHook(island: Island, payload: HookPayload) {
+ 
+       ensurePill();
+       supersedeStop();
+-      const tool = payload.tool_name ?? "Tool";
+-      const input = payload.tool_input ?? {};
+       // Claude Code (including Claude Desktop) asking a question is not a permission to grant: the island
+       // shows the options and sends back the one that was picked.
+       const isClaude = !isExternalAgent || validAgent === "claude-desktop";
+diff --git a/windows/src/island/island.ts b/windows/src/island/island.ts
+index e94e40e..9ccedce 100644
+--- a/windows/src/island/island.ts
++++ b/windows/src/island/island.ts
+@@ -16,6 +16,7 @@ import {
+ import { Sound } from "../core/sound";
+ import { State } from "../core/state";
+ import { SPOTIFY_ID, Spotify, islandDances } from "../core/spotify";
++import { YOUTUBE_MUSIC_ID, YouTubeMusic } from "../core/youtube-music";
+ import { BotEngine, hexToRGB } from "../mochi/engine";
+ import { Greeting } from "../mochi/greeting";
+ import { createMiniBot, pruneMiniBots, syncMiniBotStates, tickMiniBots } from "../mochi/minibots";
+@@ -241,6 +242,7 @@ export class Island {
+         else if (task.id === "integration_whatsapp") void Bridge.whatsappOpenApp();
+         else if (task.id === "integration_gitea") void Bridge.openGitea();
+         else if (task.id === SPOTIFY_ID) void Bridge.spotifyOpen();
++        else if (task.id === YOUTUBE_MUSIC_ID) void Bridge.youtubeMusicOpen().catch(console.error);
+         else if (urls[task.id]) void Bridge.openUrl(urls[task.id]);
+       },
+       openUrl: (url) => {
+@@ -986,13 +988,13 @@ export class Island {
+    */
+   private updateClosed() {
+     const style = closedIsland(State.settings.closedIsland);
+-    const track = Spotify.state.track;
++    const track = State.youtubeMusicPlaying ? YouTubeMusic.playback : State.spotifyPlaying ? Spotify.state.track : null;
+     const content: ClosedContent | null = State.mode === "hidden" || this.collapsed
+       ? closedContent(style, {
+         now: new Date(),
+         locale: language(),
+         planUsage: State.planUsage,
+-        music: State.spotifyPlaying && track ? { title: track.title, artist: track.artist } : null,
++        music: track?.title ? { title: track.title, artist: track.artist } : null,
+       })
+       : null;
+     const key = content ? `${style}|${content.text}|${content.dot ?? ""}|${content.note}` : style;
+@@ -1415,12 +1417,14 @@ export class Island {
+     this.engine.setOutfit(showOutfit ? outfit : "none", !inWardrobe);
+     // Dances while music plays: always in the compact island, expanded only on
+     // the music pill's card (BotCanvasView, macOS). Asked every frame.
++    const focusId = State.focusTask?.id;
+     this.engine.setDancing(islandDances({
+-      music: State.spotifyPlaying,
++      music: State.mode === "compact" ? State.spotifyPlaying || State.youtubeMusicPlaying
++        : focusId === YOUTUBE_MUSIC_ID ? State.youtubeMusicPlaying : State.spotifyPlaying,
+       state: State.effectiveState,
+       mode: State.mode,
+       view: State.view,
+-      focusId: State.focusTask?.id,
++      focusId,
+     }));
+ 
+     this.engine.update(dt);
+diff --git a/windows/src/island/youtube-music.ts b/windows/src/island/youtube-music.ts
+new file mode 100644
+index 0000000..9db3f96
+--- /dev/null
++++ b/windows/src/island/youtube-music.ts
+@@ -0,0 +1,35 @@
++import { Bridge, IS_TAURI } from "../core/bridge";
++import { State } from "../core/state";
++import { YouTubeMusic, YOUTUBE_MUSIC_ID } from "../core/youtube-music";
++import type { SpotifyHost } from "./spotify";
++
++export function registerYouTubeMusic(island: SpotifyHost) {
++  if (!IS_TAURI || State.os !== "windows") return;
++
++  const declared = () => State.settings.activeIntegrations.includes(YOUTUBE_MUSIC_ID);
++  State.subscribe(() => {
++    const task = State.tasks.find((task) => task.id === YOUTUBE_MUSIC_ID);
++    if (task) task.name = YouTubeMusic.playback?.title || "YouTube Music";
++    else YouTubeMusic.playback = null;
++  });
++
++  async function refresh() {
++    if (declared()) {
++      const next = await Bridge.youtubeMusicState();
++      if (declared()) {
++        const wasPlaying = State.youtubeMusicPlaying;
++        const previous = YouTubeMusic.playback;
++        if (next?.title !== previous?.title || next?.artist !== previous?.artist
++          || next?.playing !== previous?.playing || next?.volume !== previous?.volume) {
++          YouTubeMusic.playback = next;
++          if (!wasPlaying && State.youtubeMusicPlaying && !State.paused && State.mode === "hidden") {
++            island.revealSilently();
++          }
++          State.notify();
++        }
++      }
++    }
++    window.setTimeout(() => void refresh(), 800);
++  }
++  void refresh();
++}
+diff --git a/windows/src/main.ts b/windows/src/main.ts
+index a84d3dc..16b9d98 100644
+--- a/windows/src/main.ts
++++ b/windows/src/main.ts
+@@ -11,6 +11,7 @@ import { registerIntegrationHandlers, refreshConfigured } from "./island/integra
+ import { registerShortcutHandlers } from "./island/shortcuts";
+ import { registerVoiceHandlers } from "./island/voice";
+ import { applySpotify, registerSpotifyHandlers } from "./island/spotify";
++import { registerYouTubeMusic } from "./island/youtube-music";
+ import { registerWhatsAppHandlers } from "./island/whatsapp";
+ import { SPOTIFY_ID } from "./core/spotify";
+ import { Recap } from "./recap/recap";
+@@ -69,6 +70,7 @@ async function main() {
+   const setPaused = (on: boolean) => {
+     if (State.paused === on) return;
+     State.paused = on;
++    if (on) State.clearAutoAllow();
+     void Bridge.setPaused(on);
+   };
+ 
+@@ -164,6 +166,7 @@ async function main() {
+   registerShortcutHandlers(island, () => setPaused(false));
+   registerVoiceHandlers();
+   registerSpotifyHandlers(island);
++  registerYouTubeMusic(island);
+   registerWhatsAppHandlers(island);
+   // New versions: Rust offers the card, the island opens it when nothing else waits.
+   await Updates.register(island);
+diff --git a/windows/src/style.css b/windows/src/style.css
+index 862be0c..8c49d92 100644
+--- a/windows/src/style.css
++++ b/windows/src/style.css
+@@ -900,6 +900,18 @@ body {
+   gap: 8px;
+ }
+ 
++.approval-auto[aria-pressed="true"], .header-actions .approval-auto {
++  color: #f6c66b;
++  background: rgba(246, 198, 107, 0.12);
++}
++
++.header-actions .approval-auto {
++  border-radius: 10px;
++  padding: 0 8px;
++  font: 600 10px var(--font);
++  white-space: nowrap;
++}
++
+ /* Options to pick from when Claude Code asks a question. */
+ .actions.options {
+   flex-wrap: wrap;
+@@ -2739,6 +2751,105 @@ input[type="range"]::-webkit-slider-thumb {
+   flex-direction: column;
+ }
+ 
++.np-youtube {
++  gap: 5px;
++}
++
++.np-youtube .np-art {
++  border: 0;
++  color: #ff4545;
++  cursor: pointer;
++}
++
++.np-youtube-search {
++  display: flex;
++  gap: 6px;
++}
++
++.np-youtube-search input {
++  flex: 1;
++  min-width: 0;
++  border: 1px solid rgba(255, 255, 255, 0.15);
++  border-radius: 6px;
++  background: rgba(255, 255, 255, 0.06);
++  padding: 3px 6px;
++  font: inherit;
++  font-size: 11px;
++  color: inherit;
++}
++
++.np-youtube .np-volume input {
++  width: 52px;
++  accent-color: #ff4545;
++}
++
++.np-youtube .np-controls {
++  gap: 6px;
++  margin-top: 0;
++}
++
++.np-youtube button:disabled {
++  opacity: 0.4;
++}
++
++.np-results {
++  display: flex;
++  flex-direction: column;
++  height: 100%;
++  min-height: 0;
++  padding: 8px 10px;
++}
++
++.np-result-tabs {
++  display: flex;
++  align-items: center;
++  gap: 5px;
++  padding-bottom: 4px;
++}
++
++.np-result-tabs .icon-btn {
++  margin-inline-start: auto;
++  flex: none;
++}
++
++.np-result-tabs [aria-pressed="true"] {
++  color: #ff6969;
++  background: rgba(255, 69, 69, 0.13);
++}
++
++.np-result-list {
++  min-height: 0;
++  overflow: auto;
++  scrollbar-width: thin;
++}
++
++.np-result {
++  width: 100%;
++  min-width: 0;
++  display: flex;
++  align-items: center;
++  gap: 7px;
++  padding: 4px 6px;
++  border: 0;
++  border-radius: 6px;
++  background: transparent;
++  color: var(--ink);
++  text-align: start;
++  font: 500 11px var(--font);
++}
++
++.np-result:hover, .np-result:focus-visible {
++  background: rgba(255, 255, 255, 0.08);
++}
++
++.np-result svg { flex: none; }
++
++.np-result span {
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
+ .np-head {
+   display: flex;
+   align-items: center;
+diff --git a/windows/src/views/spotify.ts b/windows/src/views/spotify.ts
+index 27fc2e5..fb7cf63 100644
+--- a/windows/src/views/spotify.ts
++++ b/windows/src/views/spotify.ts
+@@ -112,12 +112,22 @@ function pillButton(color: string, icon: string, onClick: () => void): HTMLEleme
+  * SpotifyPill: the agent pill's look, with a mini Mochi that dances while
+  * Spotify plays, and play/pause + next on hover when a track is loaded.
+  */
+-export function buildSpotifyPill(task: AgentTask, onTap: () => void): SpotifyPillHost {
++export function buildSpotifyPill(task: AgentTask, onTap: () => void, player: {
++  dancing(): boolean;
++  playback(): { playing: boolean; track: unknown };
++  toggle(): void;
++  next(): void;
++} = {
++  dancing: () => State.spotifyPlaying,
++  playback: () => Spotify.state,
++  toggle: togglePlay,
++  next: () => void Bridge.spotifyControl("next"),
++}): SpotifyPillHost {
+   const color = task.color;
+-  const mini = createMiniBot(task, 24, () => State.spotifyPlaying);
++  const mini = createMiniBot(task, 24, player.dancing);
+   const label = h("span", { class: "lbl", text: task.name });
+-  const playBtn = pillButton(color, ICONS.play, togglePlay);
+-  const nextBtn = pillButton(color, ICONS.forward, () => void Bridge.spotifyControl("next"));
++  const playBtn = pillButton(color, ICONS.play, player.toggle);
++  const nextBtn = pillButton(color, ICONS.forward, player.next);
+   const controls = h("div", { class: "np-pill-controls" }, playBtn, nextBtn);
+   const pill = h("div", { class: "pill np-pill", onclick: onTap }, mini, label, controls);
+   pill.style.borderColor = `${color}24`;
+@@ -125,7 +135,7 @@ export function buildSpotifyPill(task: AgentTask, onTap: () => void): SpotifyPil
+   let playing: boolean | null = null;
+ 
+   const sync = () => {
+-    const s = Spotify.state;
++    const s = player.playback();
+     const current = State.tasks.find((x) => x.id === task.id);
+     const name = current?.name ?? task.name;
+     if (label.textContent !== name) label.textContent = name;
+diff --git a/windows/src/views/views.ts b/windows/src/views/views.ts
+index c8ae800..0a4e57d 100644
+--- a/windows/src/views/views.ts
++++ b/windows/src/views/views.ts
+@@ -26,6 +26,8 @@ import { buildWhatsNew } from "./whatsnew";
+ import { buildLaunch } from "./launch";
+ import { buildSpotifyCard, buildSpotifyPill, type SpotifyPillHost } from "./spotify";
+ import { SPOTIFY_ID } from "../core/spotify";
++import { YOUTUBE_MUSIC_ID } from "../core/youtube-music";
++import { buildYouTubeMusicCard, buildYouTubeMusicPill } from "./youtube-music";
+ import { buildWhatsAppCard } from "./whatsapp";
+ import { WHATSAPP_ID } from "../core/whatsapp";
+ import { MAIL_ID } from "../core/mail";
+@@ -132,6 +134,10 @@ export function buildHeader(actions: ViewActions): ViewHost {
+ 
+   const gearBtn = h("button", { title: tl("Settings"), onclick: () => go("settings") }, svg(ICONS.gearLine, 18, { stroke: 1.6 }));
+   const soundBtn = h("button", { title: tl("Mute"), onclick: () => actions.toggleSound() }, svg(ICONS.speakerLine, 18, { stroke: 1.6 }));
++  const autoAllow = h("button", {
++    class: "approval-auto", title: tl("Turn off Auto Allow"), text: tl("Auto Allow"),
++    "aria-pressed": "true", onclick: () => State.clearAutoAllow(),
++  });
+   // Folds back to the compact island now, without waiting for the timer (the
+   // Mac's ✕). A card waiting for an answer keeps the island open: no ✕ then.
+   const closeBtn = h("button", { class: "close", title: tl("Close"), onclick: () => actions.collapse() }, svg(ICONS.xmark, 17));
+@@ -150,7 +156,7 @@ export function buildHeader(actions: ViewActions): ViewHost {
+     "div",
+     { id: "header" },
+     h("div", { class: "tabs" }, tabHome, tabChat, tabDrop, tabLaunch),
+-    h("div", { class: "header-actions" }, planPills, gearBtn, soundBtn, closeBtn),
++    h("div", { class: "header-actions" }, autoAllow, planPills, gearBtn, soundBtn, closeBtn),
+   );
+   const headerActions = el.lastElementChild as HTMLElement;
+ 
+@@ -168,6 +174,7 @@ export function buildHeader(actions: ViewActions): ViewHost {
+       clear(soundBtn);
+       soundBtn.append(svg(State.settings.soundEnabled ? ICONS.speakerLine : ICONS.speakerSlashLine, 18, { stroke: 1.6 }));
+       closeBtn.style.display = State.pendingApproval ? "none" : "";
++      autoAllow.style.display = State.hasAutoAllow ? "" : "none";
+       syncPlanPills();
+       el.style.opacity = v === "confused" ? "0" : "1";
+     },
+@@ -223,6 +230,9 @@ function buildOverview(actions: ViewActions): ViewHost {
+   // runs on, and a slider being dragged must not be rebuilt under the pointer.
+   const spotifyCard = buildSpotifyCard();
+   let spotifyPill: SpotifyPillHost | null = null;
++  const youtubeMusicCard = buildYouTubeMusicCard((on) => actions.keyboard(on));
++  right.append(youtubeMusicCard.resultsEl);
++  let youtubeMusicPill: SpotifyPillHost | null = null;
+   // WhatsApp's card too: its reply field keeps the draft and the keyboard while messages arrive.
+   // Mail's card too (classic Outlook): the search field keeps its text and the keyboard.
+   const mailCard = buildMailCard({ keyboard: (on) => actions.keyboard(on) });
+@@ -240,7 +250,7 @@ function buildOverview(actions: ViewActions): ViewHost {
+   let pillIds = "";
+   let detailOpen = false;
+   let lastFocus: string | null = null;
+-  let mode: "ticker" | "card" | "plan" | "diff" | "spotify" | "whatsapp" | "mail" | null = null;
++  let mode: "ticker" | "card" | "plan" | "diff" | "spotify" | "youtube-music" | "whatsapp" | "mail" | null = null;
+   let cardKey = "";
+   /** The list row highlighted at the last sync, to scroll only when it moves. */
+   let shownSelection: number | null = null;
+@@ -397,6 +407,14 @@ function buildOverview(actions: ViewActions): ViewHost {
+           cardKey = "";
+         }
+         spotifyCard.sync();
++      } else if (task?.id === YOUTUBE_MUSIC_ID) {
++        if (mode !== "youtube-music") {
++          clear(leftBody);
++          leftBody.append(youtubeMusicCard.el);
++          mode = "youtube-music";
++          cardKey = "";
++        }
++        youtubeMusicCard.sync();
+       } else if (task && task.id === MAIL_ID) {
+         if (mode !== "mail") {
+           clear(leftBody);
+@@ -430,6 +448,9 @@ function buildOverview(actions: ViewActions): ViewHost {
+       }
+ 
+       jump.style.display = detailOpen || mode === "plan" || mode === "diff" ? "none" : "";
++      const musicResults = mode === "youtube-music" && youtubeMusicCard.showResults;
++      pills.style.display = musicResults ? "none" : "";
++      youtubeMusicCard.resultsEl.style.display = musicResults ? "" : "none";
+ 
+       // Ctrl+↓ Ctrl+↑ walk the open GitHub list (cardItemCount / cardSelection).
+       const rows = mode === "card" ? listRows(leftBody) : [];
+@@ -444,10 +465,14 @@ function buildOverview(actions: ViewActions): ViewHost {
+         pillIds = pillKey;
+         clear(pills);
+         spotifyPill = null;
++        youtubeMusicPill = null;
+         for (const t of others) {
+           if (t.id === SPOTIFY_ID) {
+             spotifyPill = buildSpotifyPill(t, () => actions.setFocus(t.id));
+             pills.append(spotifyPill.el);
++          } else if (t.id === YOUTUBE_MUSIC_ID) {
++            youtubeMusicPill = buildYouTubeMusicPill(t, () => actions.setFocus(t.id));
++            pills.append(youtubeMusicPill.el);
+           } else {
+             pills.append(buildPill(t, actions));
+           }
+@@ -455,6 +480,7 @@ function buildOverview(actions: ViewActions): ViewHost {
+         pruneMiniBots();
+       }
+       spotifyPill?.sync();
++      youtubeMusicPill?.sync();
+     },
+   };
+ }
+@@ -571,10 +597,20 @@ function buildApproval(actions: ViewActions): ViewHost {
+     if (performance.now() - shownAt < CLICK_GUARD_MS) return;
+     actions.answerInTerminal();
+   };
++  const autoAllow = h("button", {
++    class: "btn secondary approval-auto", type: "button", text: tl("Auto Allow"),
++    title: tl("Automatically allow new requests from this session"),
++    onclick: () => {
++      const request = State.pendingApproval;
++      if (!request?.requestId || !request.sessionId || request.questions || performance.now() - shownAt < CLICK_GUARD_MS) return;
++      State.setAutoAllow(request.pillId, request.sessionId, !State.autoAllows(request.pillId, request.sessionId));
++    },
++  });
+   return {
+     el,
+     sync() {
+-      const req = State.pendingApproval?.requestId ?? null;
++      const pending = State.pendingApproval;
++      const req = pending?.requestId ?? null;
+       if (req !== shownFor) {
+         shownFor = req;
+         shownAt = performance.now();
+@@ -591,6 +627,8 @@ function buildApproval(actions: ViewActions): ViewHost {
+       // a third button hands the command back to its own prompt in the terminal,
+       // where its "Always allow" lives (as on the Mac).
+       const agy = State.pendingApproval?.pillId === "agent_antigravity";
++      autoAllow.style.display = req && pending?.sessionId ? "" : "none";
++      autoAllow.setAttribute("aria-pressed", String(!!pending && State.autoAllows(pending.pillId, pending.sessionId)));
+       const key = agy ? "agy" : "built";
+       if (rowKey === key) return;
+       rowKey = key;
+@@ -598,6 +636,7 @@ function buildApproval(actions: ViewActions): ViewHost {
+       row.append(
+         btn(tl("Deny"), "secondary", guarded("deny"), "N"),
+         btn(tl("Allow"), "primary", guarded("allow"), "Y"),
++        autoAllow,
+       );
+       if (agy) row.append(btn(tl("Reply in terminal"), "secondary", inTerminal));
+     },
+diff --git a/windows/src/views/youtube-music.ts b/windows/src/views/youtube-music.ts
+new file mode 100644
+index 0000000..2c448f0
+--- /dev/null
++++ b/windows/src/views/youtube-music.ts
+@@ -0,0 +1,158 @@
++import { Bridge } from "../core/bridge";
++import { State, type AgentTask } from "../core/state";
++import { YouTubeMusic, type YouTubeMusicResult } from "../core/youtube-music";
++import { t, tl } from "../i18n/i18n";
++import { clear, dot, h, svg } from "./dom";
++import { ICONS } from "./icons";
++import { buildSpotifyPill } from "./spotify";
++
++export function buildYouTubeMusicPill(task: AgentTask, onTap: () => void) {
++  return buildSpotifyPill(task, onTap, {
++    dancing: () => State.youtubeMusicPlaying,
++    playback: () => ({
++      track: YouTubeMusic.playback?.title || null,
++      playing: State.youtubeMusicPlaying,
++    }),
++    toggle: () => void Bridge.youtubeMusicControl("toggle"),
++    next: () => void Bridge.youtubeMusicControl("next"),
++  });
++}
++
++export function buildYouTubeMusicCard(keyboard: (on: boolean) => void) {
++  const title = h("span", { class: "np-title" });
++  const artist = h("div", { class: "np-sub" });
++  const open = h("button", {
++    type: "button", class: "np-art", title: tl("Open YouTube Music"), "aria-label": tl("Open YouTube Music"),
++  }, svg(ICONS.musicNote, 16));
++  const head = h("div", { class: "np-head" }, open,
++    h("div", { class: "np-text" }, h("div", { class: "np-title-row" }, dot("#FF4545", 6), title), artist),
++  );
++  const query = h("input", {
++    type: "search", maxlength: 200, placeholder: tl("Search songs and playlists"),
++    "aria-label": tl("Search songs and playlists"),
++  });
++  const error = h("div", { class: "np-sub", role: "status" });
++  const search = h("button", { type: "submit", class: "link-btn", text: tl("Search") });
++  const form = h("form", { class: "np-youtube-search" }, query, search);
++  const songs = h("button", { type: "button", class: "link-btn", text: tl("Songs") });
++  const playlists = h("button", { type: "button", class: "link-btn", text: tl("Playlists") });
++  const close = h("button", { type: "button", class: "icon-btn", "aria-label": tl("Close") }, svg(ICONS.xmark, 12));
++  const matches = h("div", { class: "np-result-list", "aria-live": "polite" });
++  const resultsEl = h("div", { class: "np-results" }, h("div", { class: "np-result-tabs" }, songs, playlists, close), matches);
++  resultsEl.style.display = "none";
++  let results: YouTubeMusicResult[] = [];
++  let selectedKind: YouTubeMusicResult["kind"] = "song";
++  let showResults = false;
++
++  function renderResults() {
++    songs.setAttribute("aria-pressed", String(selectedKind === "song"));
++    playlists.setAttribute("aria-pressed", String(selectedKind === "playlist"));
++    clear(matches);
++    const visible = results.filter((result) => result.kind === selectedKind);
++    if (!visible.length) matches.append(h("div", { class: "np-sub", text: tl("Nothing found") }));
++    for (const result of visible) {
++      const button = h("button", { type: "button", class: "np-result", title: result.title },
++        svg(ICONS.play, 11), h("span", { text: result.title }));
++      button.addEventListener("click", async () => {
++        button.disabled = true;
++        error.textContent = "";
++        if (await Bridge.youtubeMusicPlay(result)) {
++          showResults = false;
++          State.notify();
++        } else {
++          error.textContent = t("Failed");
++        }
++        button.disabled = false;
++      });
++      matches.append(button);
++    }
++  }
++
++  for (const [kind, button] of [["song", songs], ["playlist", playlists]] as const) {
++    button.addEventListener("click", () => {
++      if (search.disabled) return;
++      selectedKind = kind;
++      renderResults();
++    });
++  }
++  close.addEventListener("click", () => {
++    showResults = false;
++    State.notify();
++  });
++  form.addEventListener("submit", (event) => {
++    event.preventDefault();
++    const text = query.value.trim();
++    if (!text || search.disabled) return;
++    query.blur();
++    search.disabled = true;
++    error.textContent = "";
++    showResults = true;
++    clear(matches);
++    matches.append(h("div", { class: "np-sub", text: tl("Searching…") }));
++    State.notify();
++    void Bridge.youtubeMusicSearch(text).then((found) => {
++      results = found;
++      selectedKind = found[0]?.kind ?? "song";
++      renderResults();
++    }).catch((err) => {
++      console.error("[coucou] YouTube Music search failed", err);
++      results = [];
++      clear(matches);
++      matches.append(h("div", { class: "np-sub", text: tl("Failed") }));
++    }).finally(() => { search.disabled = false; });
++  });
++  query.addEventListener("pointerdown", () => keyboard(true));
++  query.addEventListener("focus", () => keyboard(true));
++  query.addEventListener("blur", () => keyboard(false));
++  query.addEventListener("keydown", (event) => {
++    if (event.key === "Escape") query.blur();
++    event.stopPropagation();
++  });
++  open.addEventListener("click", () => {
++    error.textContent = "";
++    void Bridge.youtubeMusicOpen().catch(() => { error.textContent = t("Could not open YouTube Music"); });
++  });
++
++  const previous = h("button", { class: "np-icon", "aria-label": tl("Previous") }, svg(ICONS.backward, 14));
++  const play = h("button", { class: "np-play" });
++  const next = h("button", { class: "np-icon", "aria-label": tl("Next") }, svg(ICONS.forward, 14));
++  previous.addEventListener("click", () => void Bridge.youtubeMusicControl("previous"));
++  play.addEventListener("click", () => void Bridge.youtubeMusicControl("toggle"));
++  next.addEventListener("click", () => void Bridge.youtubeMusicControl("next"));
++  const volume = h("input", { type: "range", min: 0, max: 100, value: 50, "aria-label": tl("YouTube Music volume") });
++  let pendingVolume: number | null = null;
++  volume.addEventListener("input", () => {
++    const requested = volume.valueAsNumber;
++    pendingVolume = requested;
++    void Bridge.youtubeMusicControl("volume", requested).then((sent) => {
++      if (!sent && pendingVolume === requested) pendingVolume = null;
++    });
++  });
++  const controls = h("div", { class: "np-controls" },
++    h("div", { class: "np-buttons" }, previous, play, next),
++    h("div", { class: "np-volume" }, svg(ICONS.volume2, 14, { stroke: 1.5 }), volume),
++  );
++  const el = h("div", { class: "np-card np-youtube" }, head, form, controls, error);
++  let playing: boolean | undefined;
++  return {
++    el,
++    resultsEl,
++    get showResults() { return showResults; },
++    sync() {
++      const active = YouTubeMusic.playback;
++      title.textContent = active?.title || "YouTube Music";
++      artist.textContent = active?.artist || t("Not playing");
++      previous.disabled = play.disabled = next.disabled = !active?.title;
++      volume.disabled = !active;
++      if (active && active.volume === pendingVolume) pendingVolume = null;
++      if (active && pendingVolume == null && document.activeElement !== volume) volume.value = String(active.volume);
++      play.setAttribute("aria-label", active?.playing ? t("Pause") : t("Play"));
++      const isPlaying = active?.playing ?? false;
++      if (playing !== isPlaying) {
++        clear(play);
++        play.append(svg(isPlaying ? ICONS.pause : ICONS.play, 14));
++        playing = isPlaying;
++      }
++    },
++  };
++}
+diff --git a/windows/tests/hooks.test.mjs b/windows/tests/hooks.test.mjs
+index e6ccc62..95fad8f 100644
+--- a/windows/tests/hooks.test.mjs
++++ b/windows/tests/hooks.test.mjs
+@@ -38,6 +38,7 @@ beforeEach(() => {
+   State.paused = false;
+   State.isPinned = false;
+   State.pendingApproval = null;
++  State.clearAutoAllow();
+   State.approvalQueue = [];
+   State.focusBeforeApproval = null;
+   State.settings = { ...DEFAULT_SETTINGS };
+@@ -64,6 +65,35 @@ test("a paused island hands a permission request straight back to the terminal",
+   assert.equal(task().state, "idle");
+ });
+ 
++test("Auto Allow takes effect only for new permission requests from the selected agent session", () => {
++  const request = { hook_event_name: "PermissionRequest", session_id: "s1", tool_name: "Bash", coucou_agent: "codex" };
++  hook({ ...request, request_id: "current" });
++  State.setAutoAllow("agent_codex", "s1", true);
++  hook({ ...request, request_id: "current" });
++  hook({ ...request, request_id: "other-session", session_id: "s2" });
++  hook({ ...request, request_id: "other-agent", coucou_agent: "copilot-cli" });
++  hook({ ...request, request_id: "new" });
++  assert.equal(State.pendingApproval.requestId, "current");
++  assert.deepEqual(sent("approval_decision"), [{ requestId: "new", decision: "allow" }]);
++  State.setAutoAllow("agent_codex", "s1", false);
++  hook({ ...request, request_id: "after-off" });
++  assert.ok(State.approvalQueue.some((queued) => queued.requestId === "after-off"));
++});
++
++test("Auto Allow leaves questions for the user and expires when that session ends", () => {
++  const request = { hook_event_name: "PermissionRequest", session_id: "claude-1", tool_name: "Bash" };
++  State.setAutoAllow(CLAUDE, "claude-1", true);
++  hook({ ...request, request_id: "q", tool_name: "AskUserQuestion", tool_input: { questions: [
++    { question: "Which?", options: [{ label: "One" }, { label: "Two" }] },
++  ] } });
++  assert.ok(State.pendingApproval.questions);
++  hook({ hook_event_name: "SessionEnd", session_id: "claude-1" });
++  assert.equal(State.hasAutoAllow, false);
++  hook({ ...request, request_id: "after-end" });
++  assert.deepEqual(sent("approval_decision"), []);
++  assert.equal(State.pendingApproval.requestId, "after-end");
++});
++
+ test("a paused island ignores every other event", () => {
+   State.paused = true;
+   hook({ hook_event_name: "SessionStart", cwd: "C:\\Users\\me\\proj" });
+diff --git a/windows/tests/pills.test.mjs b/windows/tests/pills.test.mjs
+index f52f1ad..fab1d04 100644
+--- a/windows/tests/pills.test.mjs
++++ b/windows/tests/pills.test.mjs
+@@ -49,7 +49,7 @@ test("the catalog holds the Mac's pills with the Claude Code label for Windows a
+     ["integration_whatsapp", "WhatsApp", "#25D366", "service", "Integration"],
+   ];
+   assert.deepEqual(
+-    PILL_CATALOG.filter((p) => !["integration_gitlab", "integration_gitea"].includes(p.id))
++    PILL_CATALOG.filter((p) => !["integration_gitlab", "integration_gitea", "integration_youtube_music"].includes(p.id))
+       .map((p) => [p.id, p.name, p.color, p.category, p.subtitle]),
+     mac,
+   );
+@@ -116,7 +116,8 @@ test("this build leaves out what only macOS has", () => {
+   // Spotify: MPRIS on Linux, the system media controls on Windows.
+   assert.ok(linux.includes("integration_spotify"));
+   assert.ok(windows.includes("integration_spotify"));
+-  assert.deepEqual(linux, windows.filter((id) => id !== "integration_mail"));
++  assert.ok(windows.includes("integration_youtube_music"));
++  assert.deepEqual(linux, windows.filter((id) => !["integration_mail", "integration_youtube_music"].includes(id)));
+ });
+ 
+ test("Spotify: a service on both systems with nothing to set up", () => {
+diff --git a/windows/tests/youtube-music.test.mjs b/windows/tests/youtube-music.test.mjs
+new file mode 100644
+index 0000000..abf0be1
+--- /dev/null
++++ b/windows/tests/youtube-music.test.mjs
+@@ -0,0 +1,89 @@
++import assert from "node:assert/strict";
++import { readFileSync } from "node:fs";
++import test from "node:test";
++import { runInNewContext } from "node:vm";
++
++const script = readFileSync(new URL("../src-tauri/src/youtube_music.js", import.meta.url), "utf8");
++
++test("the injected controls exist only in the YouTube Music origin", () => {
++  const window = {};
++  runInNewContext(script, { window, location: new URL("https://www.youtube.com/watch?v=example") });
++  assert.equal(window.coucouMusic, undefined);
++});
++
++test("music search yields deduplicated songs and playlists from the active query", () => {
++  const window = {};
++  let played = "";
++  const makeRow = (title, href, playlist = false) => ({
++    querySelector: (selector) => selector === ".title" ? { textContent: title }
++      : playlist ? { click: () => { played = title; } } : null,
++    querySelectorAll: () => [{ href, click: () => { played = title; } }],
++  });
++  const song = makeRow("First song", "https://music.youtube.com/watch?v=valid-song");
++  const playlist = makeRow("Good playlist", "https://music.youtube.com/browse/VLplaylist_id", true);
++  const page = { data: {}, querySelector: () => ({}), querySelectorAll: () => [
++    song, song, playlist, makeRow("Browser video", "https://www.youtube.com/watch?v=outside"),
++  ] };
++  runInNewContext(script, {
++    window, URL, location: new URL("https://music.youtube.com/search?q=example"),
++    localStorage: { getItem: () => null },
++    document: { querySelector: () => page, addEventListener() {} },
++    MutationObserver: class { observe() {} },
++  });
++  const player = window.coucouMusic;
++  assert.equal(player.results("old"), null);
++  assert.deepEqual(JSON.parse(JSON.stringify(player.results("example"))), [
++    { id: "valid-song", kind: "song", title: "First song" },
++    { id: "playlist_id", kind: "playlist", title: "Good playlist" },
++  ]);
++  assert.equal(player.play("song", "valid-song"), true);
++  assert.equal(played, "First song");
++  assert.equal(player.play("playlist", "playlist_id"), true);
++  assert.equal(played, "Good playlist");
++  assert.equal(player.play("song", "outside"), false);
++});
++
++test("the player's volume survives an ad and carries over to a replacement audio element", () => {
++  let ad = false;
++  let element = { volume: 1, muted: false, currentSrc: "track", paused: false, ended: false };
++  let skipped = 0;
++  const storage = new Map();
++  const player = {
++    classList: { contains: () => ad },
++    querySelector: (selector) => selector === "video, audio" ? element : { click: () => { skipped++; } },
++  };
++  const window = {};
++  const handlers = new Map();
++  runInNewContext(script, {
++    window,
++    location: new URL("https://music.youtube.com/"),
++    localStorage: { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
++    navigator: { mediaSession: { metadata: { title: "Song", artist: "Artist" } } },
++    document: { querySelector: (selector) => selector === "#movie_player" ? player : null,
++      addEventListener: (name, callback) => handlers.set(name, callback) },
++    MutationObserver: class { observe() {} },
++  });
++  const controls = window.coucouMusic;
++  assert.equal(controls.state().title, "Song");
++  assert.equal(element.volume, 0.5);
++  controls.volume(23);
++  assert.equal(element.volume, 0.23);
++  assert.equal(storage.get("coucou.music.volume"), "23");
++  element.volume = 0.8;
++  handlers.get("volumechange")({ target: element });
++  assert.equal(element.volume, 0.23);
++  element.volume = 1;
++  assert.equal(controls.state().volume, 23);
++  assert.equal(element.volume, 0.23);
++  ad = true;
++  assert.equal(controls.state().playing, false);
++  assert.equal(element.muted, true);
++  assert.equal(skipped, 1);
++  ad = false;
++  assert.equal(controls.state().playing, true);
++  assert.equal(element.muted, false);
++  assert.equal(element.volume, 0.23);
++  element = { ...element, volume: 1 };
++  assert.equal(controls.state().volume, 23);
++  assert.equal(element.volume, 0.23);
++});
